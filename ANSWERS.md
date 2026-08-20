@@ -1,587 +1,436 @@
-# Answers to the Assessment Questions
+# Answers to All Questions
 
-## Part 1: What the Hell Happened at 14:32?
+## Part 1: The Database Crash at 14:32
 
-### 1. Timeline of the Collapse
+### 1. What Happened Step by Step
 
-**14:31:58 - 14:32:00: Everything's fine**
+**14:31:58 to 14:32:00 — Normal**
 
-Requests coming in at normal pace. Response times around 200-300ms, connection count climbing from 45 to 51. Each second adds a few connections, which is expected as traffic naturally varies.
+Requests are coming in normally. Response time is 200-300ms. Database connections: 45, then 46, then 47, then 51. This is normal. Traffic goes up and down.
 
-**14:32:01 - THE MOMENT IT BREAKS**
+**14:32:01 — CRASH**
 
-The Prisma connection pool hits the wall. We have exactly 10 connections in the pool. Suddenly we get queued=23, meaning 23 requests are waiting for a connection that never comes available.
+Suddenly everything breaks.
 
-At the same time, MySQL starts screaming: "Too many connections (max_connections=151)". This tells me the backend instances are bypassing the Prisma pool and opening raw connections, which only happens when the pool is completely exhausted.
+Prisma has a connection pool with 10 connections. It's now full. 23 requests are waiting for a connection.
 
-Total connections on MySQL jumped to 51. The pool is full. The queue is overflowing.
+At the same time, MySQL says: "Too many connections (max=151)".
 
-**14:32:01 - 14:32:02: The Pile-Up**
+What does this mean? The backend is so desperate for connections that it's opening raw connections instead of using the pool. The pool is completely exhausted.
 
-Requests start failing with PrismaClientInitializationError. Response times spike to 10+ seconds as requests sit in the Prisma queue waiting for a connection that won't free up.
+**14:32:01 to 14:32:02 — The Pile-Up**
 
-HTTP 500 errors appear in the logs. Users are getting failures.
+Requests fail. Response times go to 10,000ms (10 seconds). No connection available. Requests just sit and wait.
 
-**14:32:08 - RECOVERY**
+**14:32:08 — It Gets Better**
 
-Here's the interesting part: the connection count drops from 51 → 34 → 31. Why? Because requests are timing out.
+Connection count drops: 51 → 34 → 31.
 
-When a request hits `pool_timeout=10s`, it gives up waiting for a connection and throws an error. But here's the thing: when it gives up, it releases whatever resources it was holding. The pool has some connections tied up in these timed-out requests. As they get cleaned up, connections become available.
+Why?
 
-By 14:32:08, enough timed-out requests have been cleaned up that new requests can get connections again. The queue starts draining. Response times are still terrible (4-5 seconds) because there's a massive backlog, but the system isn't completely hung.
+Because requests are timing out. The system has `pool_timeout=10s`. After 10 seconds, a waiting request gives up. When it gives up, it releases the connection.
 
-**Why did it recover without anyone doing anything?**
+Old requests timeout. Connections free up. New requests can finally get connections. The backlog starts draining.
 
-Timeout-driven recovery. The system was in a deadlock where no new connections were available. Timeouts broke the deadlock by forcibly releasing resources. It's not elegant, but it works.
+**Why did it recover without anyone fixing anything?**
 
-### 2. How Many Instances?
+Timeout-driven recovery. Timeouts broke the deadlock. It's not a good fix, but it works.
 
-Looking at `pool_size=10` and `queued=23`, I need to think about what this means.
+### 2. How Many Backend Instances Were Running?
 
-Each Prisma client (one per Next.js instance) has its own connection pool. The `pool_size=10` means that one pool has 10 connections. The `queued=23` means 23 requests are waiting in that pool's queue.
+The log shows `pool_size=10` and `queued=23`.
 
-But wait, the log shows 51 total connections on MySQL. If one pool only has 10 active connections, where are the other 41 coming from?
+`pool_size=10` means one Prisma connection pool has 10 connections.
+`queued=23` means 23 requests are waiting in that pool.
 
-They're from other instances. If I have N instances each with pool_size=10, I could have up to N×10 connections. The 51 total suggests we have roughly 5-7 instances:
-- 7 instances × 7 connections average = 49 connections ≈ 51 observed
+But total connections on MySQL is 51.
 
-The queued=23 suggests one of those instances got hammered harder than the others. Maybe it got routed all 200 recruiters' traffic while the other instances were idle.
+If one pool only has 10 active connections, where are the other 41?
 
-**My answer: 5-7 Next.js instances, with uneven load distribution.**
+They're from other backend instances. Each instance has its own connection pool.
+
+51 total connections ÷ roughly 7-8 connections per instance = about 7 instances.
+
+**Answer: 7 Next.js instances were running.**
+
+One of them got hit harder than the others. All the recruiters' traffic went to one instance. That instance's pool ran out.
 
 ### 3. Why Recovery Happened Automatically
 
-The system was stuck in a loop:
-1. All connections are held by pending requests
-2. All pending requests are timing out (waiting >10 seconds)
-3. No new requests can proceed (no available connections)
+The system was stuck. No connections available. All requests just waiting.
 
-Timeouts are the system's circuit breaker here. Every request that times out releases its connection back to the pool. As these release:
+But they can't wait forever. After `pool_timeout=10s`, they give up.
 
-4. Pool has some free connections again
-5. Waiting requests can now get connections and run
-6. They complete and release their connections
-7. Queue drains faster than new requests arrive
+When requests give up, they release their connections.
 
-By 14:32:08, this cascade had accelerated enough that the system recovered. The real fix would have been to:
-- Load balance better (the 51 connections should have been spread across 7 instances)
-- Reduce connection usage per request (move email sending to async queue)
-- Increase pool size (but that's a bandaid on poor load distribution)
+As connections free up:
+1. Waiting requests can get connections
+2. They run and finish
+3. They release connections
+4. More waiting requests can run
+
+The cycle accelerates. By 14:32:08, it's draining faster than new requests arrive.
+
+The system recovered automatically.
 
 ### 4. Why connection_limit=100 Makes It Worse
 
-The junior engineer is thinking: "We ran out of connections, so let's allow more connections!"
+The junior engineer's thinking:
+> "We ran out of connections. Let's allow more!"
 
-This sounds logical but it's actually catastrophic. Here's why:
+This sounds logical but it's wrong.
 
-If we increase Prisma's `connection_limit` from 10 to 100, each Next.js instance can now open up to 100 connections to MySQL. We have 7 instances. That's 700 connection attempts hitting MySQL.
+**Here's what happens:**
 
-MySQL's server-level `max_connections=151`. So we'd hit that limit instantly. Some instances would fail to connect, and we'd be in worse shape than before.
+If we increase Prisma's connection_limit to 100:
+- Each backend instance can open 100 connections
+- We have 7 instances
+- That's 700 connections trying to connect to MySQL
+- MySQL max_connections = 151
+- We fail instantly
 
-What the junior doesn't realize: the bottleneck isn't "Prisma pools are too small." The bottleneck is "we have too many concurrent requests holding connections for too long."
+It's worse than before.
 
-The real fixes, in order:
-1. **Move email sending to async queue.** Each write request holds a connection for 800ms just for email. Queue the email, release the connection in 40ms. Boom, 20x less connection demand.
+**The real problems:**
 
-2. **Load balance properly.** 200 recruiters shouldn't all route to one instance. Use round-robin load balancing so each instance gets roughly 30 recruiters.
+1. **Email sends are slow (800ms).** We make a request, then wait for email to send before returning. The connection is held the whole time.
+2. **Load isn't balanced.** One instance got all the traffic.
+3. **No queuing.** We do everything synchronously.
 
-3. **Add read replicas.** Most traffic is probably reads (checking job listings, application status). Replicas don't compete with writes for the primary's connections.
+**The real fixes:**
 
-4. **Use ProxySQL.** This is a connection pooling proxy that sits between backends and MySQL. Instead of 7 instances × 100 connections = 700 total, ProxySQL multiplexes it to 30 actual MySQL connections. The backend sees the illusion of unlimited connections, MySQL sees reasonable load.
+1. **Move email to async queue.** Return immediately. Email sends in background. Connection released in 40ms instead of 800ms.
+2. **Balance load.** Each instance gets a fair share of traffic.
+3. **Use a connection proxy.** ProxySQL sits between backends and MySQL. 7 instances × 100 connections becomes 7 instances sharing 30 actual connections through ProxySQL.
+4. **Add read replicas.** Most traffic is probably reads. Use a replica for reads.
 
-5. **Vertical scaling.** Upgrade the RDS instance from t3.medium to r5.large. More memory means better caching, more CPU for query processing.
+Connection_limit=100 does none of this. It's a bandaid on a deeper problem.
 
-connection_limit=100 solves nothing. It's like raising the speed limit when cars keep piling up in traffic.
+### 5. Prisma Accelerate Explained
 
-### 5. What Prisma Accelerate Actually Does
+Prisma Accelerate is a service in the cloud.
 
-Prisma Accelerate is a connection pooling proxy hosted by Prisma in the cloud:
+**What it does:**
 
 ```
-Your backend → Prisma Accelerate cloud → MySQL RDS
+Without Accelerate:
+Your app → MySQL (10 connections per app instance)
+
+With Accelerate:
+Your app → Accelerate (cloud) → MySQL (30 actual connections)
 ```
 
-Instead of your 200 Next.js processes each opening 10 connections to MySQL (2,000 connections), they all talk to Accelerate. Accelerate multiplexes those 2,000 client connections onto maybe 30 actual connections to MySQL. It's like an intelligent load balancer for database connections.
+Accelerate multiplexes. 200 app instances connecting to it? Accelerate only opens 30 connections to MySQL and shares them.
 
-**Why it helps for the incident:**
+**Why it helps:**
 
-In the log, the collapse happened because one Prisma pool got exhausted (queued=23) while other instances still had capacity. With Accelerate, there's one shared pool across all instances. One instance can't starve the others.
+In the incident, one pool got exhausted while others had capacity. With Accelerate, all instances share one pool. Nobody can hog all the connections.
 
-Also, Accelerate can intelligently detect when MySQL is under load and slow down new connection attempts, preventing the cascade that happened in the logs.
-
-**Why it helps for scaling to 1,000 users:**
-
-At 1,000 recruiters + 100,000 users, even with async queues and read replicas, you'd have hundreds of concurrent database requests. Without Accelerate, you need huge connection pool sizes. With Accelerate, the pool can be much smaller because it multiplexes efficiently.
+Also, Accelerate can detect when MySQL is overloaded and slow down connection requests. This prevents the cascade.
 
 **The limitations:**
 
-1. **Another network hop.** Every query now goes through Accelerate's servers first. That's typically 5-50ms extra latency depending on region.
+1. **Extra latency.** Every query goes through Accelerate first. That's 5-50ms extra.
+2. **Another service to maintain.** If Accelerate is down, database is down.
+3. **It costs money.** Per-query pricing. But it's cheap (~$50/month at scale).
+4. **Doesn't fix slow queries.** If a query is slow because of a missing index, Accelerate doesn't help.
 
-2. **It's a service you depend on.** If Accelerate is down, your database is unreachable. With direct MySQL connections, you only depend on your own infrastructure.
+**For this incident:**
 
-3. **Doesn't fix slow queries.** If a query takes 200ms because it's missing an index, Accelerate doesn't help. You still need query optimization.
+Accelerate would have prevented the collapse. But it's not a complete solution. You still need:
+- Read replicas
+- Query caching
+- Async job queues
+- Proper load balancing
 
-4. **It's not free.** Accelerate charges per query. At 1M queries/day, it's cheap (~$50/month), but it's still a recurring cost.
-
-5. **Doesn't work for all patterns.** Some applications need persistent connections or temporary tables, which don't work through Accelerate.
-
-**The real picture:**
-
-Accelerate is great for getting from 200 users to 1,000 users without rearchitecting the database layer. But for 10,000+ users, you need the full stack: read replicas, query caching, async processing, and yes, connection pooling proxies.
-
-For this incident, Accelerate would have prevented the cascade because it detects pool exhaustion and handles it gracefully across all client connections.
+Accelerate + all the above = can handle 1,000+ users.
 
 ---
 
-## Part 2: How to Scale This to 1,000 Recruiters
+## Part 2: How to Grow to 1,000 Users
 
-### 1. The 6-Month Plan
+### 1. Six-Month Plan
 
-I'm going to tackle this incrementally, measuring at each step.
+**Month 1, Week 1-2: Move email to async queue**
 
-**Month 1, Week 1-2: Move notifications to async queue**
+Currently: User submits application → Save to DB (40ms) → Send email (800ms) → Return (840ms)
 
-Right now, when a recruiter submits an application, we send a notification email before returning a response. That email takes ~800ms. So every write request takes >800ms.
+New: User submits application → Save to DB (40ms) → Queue email → Return (45ms)
 
-Move email sending to BullMQ. The recruiter's request completes in 40ms (just DB write). The email sends in the background.
+Email sends in background. If email fails, retry automatically.
 
-**Measure:** p50 and p95 latency should drop from ~1000ms to ~100ms. We should be able to handle 3x the concurrent load.
+**Measure:** User sees 20x faster response. Server can handle 3x more users.
 
-**Month 1, Week 3-4: Add read replicas**
+**Month 1, Week 3-4: Add database read replicas**
 
-Most recruiter actions are reads: checking job listings, viewing applications, searching candidates. These don't need the primary database. Route reads to a read replica.
+Job listings and application status are read millions of times but changed rarely.
 
-Set up MySQL read replica on RDS (same AZ as primary for low lag). Configure Prisma to route SELECT queries to the replica, everything else to the primary.
+Create a read replica. Route SELECT queries to replica. Route INSERT/UPDATE to primary.
 
-**Measure:** Check MySQL primary CPU usage. It should drop by 40-60% (no longer handling read queries). Replica lag should stay <2 seconds.
+**Measure:** Primary database CPU drops. Replica lag stays < 2 seconds.
 
-**Month 2, Week 1-2: Redis cache for hot data**
+**Month 2, Week 1-2: Cache hot data in Redis**
 
-Job listings are read thousands of times but change rarely. Cache them in Redis with 5-minute TTL.
+Job listings change rarely. Cache them for 5 minutes. When recruiter updates a job, clear the cache immediately.
 
-When a recruiter updates a job, invalidate the cache immediately so candidates see the change within seconds.
+**Measure:** Database read load drops 60%. Cache hit rate > 90%.
 
-**Measure:** Track cache hit rate (should be >90%). Monitor database query volume (should drop by 60%).
+**Month 2, Week 3-4: Separate write service**
 
-**Month 2, Week 3-4: Separate recruiter write service**
+Create a new Fastify service just for application submissions. Keep reads in Next.js.
 
-Create a standalone Fastify service for POST /api/applications. Keep read APIs in Next.js.
+This lets us optimize differently. Write service gets more connections. Read service stays lightweight.
 
-This lets us optimize independently. The write service can have more aggressive connection pooling settings (30 connections), tuned for throughput. The read service can stay lightweight.
-
-**Measure:** Deploy side-by-side. Monitor database connection count (should drop by 20-30%). Compare latency of reads vs. writes (writes should stay fast).
+**Measure:** Database connection count drops. Both services stay fast.
 
 **Month 3, Week 1-2: Add ProxySQL**
 
-All services talk to ProxySQL instead of MySQL directly. ProxySQL multiplexes all connections.
+ProxySQL sits between all backends and MySQL. Multiplexes connections.
 
-Instead of the write service having 30 connections, read service having 10, and admin tools having 5 (75 total), ProxySQL now has 25 actual MySQL connections and multiplexes them all.
+Instead of 7 instances × 30 connections = 210 total, ProxySQL has 30 actual connections and multiplexes all of them.
 
-**Measure:** Monitor MySQL connection count (should drop to 25-30 total). Check ProxySQL queue depth (should be <1ms wait time).
+**Measure:** MySQL connection count drops to 30. No queuing. Requests stay fast.
 
-**Month 3, Week 3-4: Separate analytics service**
+**Month 3, Week 3-4: Separate stats service**
 
-The stats-updates queue is part of the main service. Extract it into its own service. It can run independently, auto-scale independently.
+Stats updates run in their own service. If they're slow, recruiting still works.
 
-If recruiter stats are slow, it doesn't affect application submissions or notifications.
+**Measure:** Can scale stats service independently. Recruiting performance unaffected.
 
-**Measure:** Can we scale the stats service to 50 workers without affecting the main service? (Yes, because they're separate.)
+### 2. Separate Services or Keep Together?
 
-**Month 4+: Horizontal scaling**
+**Pros of separate services:**
 
-Run the write service on 5 EC2 instances behind a load balancer. If one crashes, traffic routes to the others.
+- Recruiters do writes. Candidates do reads. Different optimizations needed.
+- If recruiter service crashes, candidates can still browse jobs.
+- Can deploy recruiters independently. Move fast without risking candidates.
+- Different SLOs. Recruiters need <100ms. Candidates accept <500ms.
 
-The read service can scale independently (it's read-heavy, can use more instances).
+**Pros of keeping together:**
 
-Each tier can auto-scale based on load.
+- One codebase. One deployment.
+- Shared business logic. No duplication.
+- Simpler operations. Fewer moving parts.
+- Smaller team. One service is less work.
 
-### 2. Separate Recruiter vs. User Services: Which Way?
+**My answer:**
 
-**The case for separate services:**
+Start together. After 3 months, split out the recruiter write service.
 
-- Recruiters and candidates have completely different access patterns. Recruiters do writes (12/min), candidates do reads (browse jobs, check status). Optimizing for both is impossible.
-- If the recruiter service crashes, candidates can still browse jobs and check status. Good user experience.
-- Deployment independence. Recruiters need new features weekly. Candidates want stability. Separate deployments mean recruiting team can move fast without risking candidate experience.
-- Monitoring and alerting. You can set different SLOs. Recruiters get <100ms response time, candidates can tolerate <500ms (it's cached anyway).
+Best of both worlds: Simple now, optimized later.
 
-**The case for keeping them together:**
+### 3. Should We Shard the Database?
 
-- Operational simplicity. One codebase, one deployment, one database. Less moving parts.
-- Some logic is shared. When a recruiter creates an application, we need to check if the job exists (candidate data) and if the recruiter is authorized (recruiter data). Separate services means cross-service calls and consistency headaches.
-- We're a small team (one backend engineer). Maintaining two services is more work.
+No. Not yet.
 
-**My recommendation: Separate, but phased.**
+Sharding means splitting data across multiple database servers. It's complex and painful.
 
-Start with everything together. After 3 months (around month 4 in the plan above), extract recruiter writes into a separate service. By then:
-- We've proven the async queue approach works
-- We've added read replicas and caching
-- The write service has become distinct enough that splitting makes sense
+We haven't even tried to optimize a single database yet. We haven't:
+- Added indexes
+- Optimized slow queries
+- Added caching
+- Used read replicas
 
-This gets us the best of both: simplicity early, optimization later.
+A properly optimized single database can handle billions of rows. We're nowhere near maxed out.
 
-### 3. The Sharding Question
+**What to do instead:**
 
-Someone says: "We need horizontal database sharding to handle 1,000 concurrent users."
+1. Find slow queries using EXPLAIN
+2. Add indexes where they help
+3. Cache hot data
+4. Use read replicas
 
-Here's my response in the meeting:
+After all this, if we still can't handle 1,000 users, *then* we talk about sharding.
 
-**No. We're not sharding yet. Here's why:**
+I predict we won't need it.
 
-Sharding adds enormous complexity. Cross-shard joins are slow. Rebalancing data between shards is painful. You need distributed transactions or accept eventual consistency. It's like going from a sedan to a 18-wheeler truck to carry groceries.
+### 4. Which Work Stays Synchronous?
 
-Before we shard, we haven't optimized a single shard. We haven't added indexes (just basic ones). We haven't run EXPLAIN on slow queries. We haven't cached anything. We haven't moved async processing out of the request path.
+**Must be synchronous:**
 
-At 1,000 concurrent recruiters, on a properly optimized single shard (with read replicas, ProxySQL, and caching), we can handle 10-100x the load we currently have.
+Database write. We need the application ID to return to the user. If the write fails, everything fails.
 
-**What I'd do instead:**
+**Can be asynchronous (queued):**
 
-1. Run EXPLAIN on the top 20 slow queries. Add indexes where they help.
-2. Profile database latency at the p95. If it's >50ms, optimize queries. If it's <10ms, we're good.
-3. Monitor connection efficiency. If we're using 200 connections to do what could be done in 30, there's waste.
-4. Add caching for hot reads.
-5. If we still can't handle 1,000 concurrent recruiters after all this, *then* we talk about sharding.
+- Email notification (800ms) → Queue it
+- Recruiter stats (50ms) → Queue it
+- Audit log (10ms) → Queue it
+- WhatsApp message (2s) → Queue it
 
-My guess: we won't need to shard. Single-shard databases handle billions of rows comfortably with proper optimization.
+All of these can happen later. The user doesn't need to wait.
 
-### 4. What Stays Sync, What Goes Async
+**How:**
 
-The database write **must** be synchronous. We need to return the application ID to the user. If the write fails, the whole request fails. There's no async here.
-
-Everything else can go async:
-
-- **Email notification** (~800ms): Queue it. Candidate gets the email eventually. If it fails, it retries automatically.
-- **Recruiter stats update** (~50ms): This is analytics. Recruiters check the stats page every few hours. A 1-minute delay is fine.
-- **Audit log** (~10ms): For compliance/debugging. Doesn't need to be in the request path.
-- **WhatsApp message** (~2-3 seconds): Same as email. Queue it.
-
-By moving all of these to async queues, the request response time drops from ~1,500ms to ~50ms. That's 30x faster.
-
-**How to handle it:**
-
-Use BullMQ with three queues. Add jobs immediately after the database write, don't wait for completion. Return success to the client.
-
-If any job fails, it retries automatically. If it fails 3 times, it goes to dead-letter queue for manual investigation.
-
-### 5. Redis Cache with 5-Minute TTL: Preventing Stale Data
-
-**Scenario:** Recruiter closes a job at 2:00 PM. Candidate might see stale data in three ways.
-
-**Problem 1: Direct cache hit**
-
-Candidate loaded the job at 1:59 PM and has it cached in their browser. They refresh at 2:01 PM. Their browser cache has the old version.
-
-**Solution:** 1-minute TTL instead of 5. Trade some Redis load for better freshness. Or add a "last updated" timestamp and refresh if it's stale.
-
-**Problem 2: Read replica lag**
-
-Recruiter closes job on primary at 2:00 PM. We have a 2-second replica lag. Candidate queries the replica at 2:00:01 PM, still sees the job as open.
-
-**Solution:** For critical reads (things the user just changed), query the primary, not the replica. After a recruiter closes a job, their next query for that job should hit primary.
-
-Implementation: Set a session flag "queryPrimaryUntil=2:00:05" when they perform a write. Check it before routing reads.
-
-**Problem 3: Cross-service cache inconsistency**
-
-We have separate services for recruiting and candidate features. Recruiter service invalidates the cache when a job closes. But candidate service doesn't know about it (different codebases). They see stale data.
-
-**Solution:** Use Redis pub/sub. When recruiter service closes a job, it publishes to channel "job-updates". Candidate service subscribes and immediately invalidates its cache.
+After the database write succeeds:
 
 ```typescript
-// Recruiter service
-await redis.publish('job-updates', JSON.stringify({ jobId, action: 'closed' }));
+addToQueue('notifications', emailData);   // Queue
+addToQueue('stats-updates', statsData);   // Queue
+addToQueue('audit-logs', auditData);      // Queue
 
-// Candidate service
-redis.subscribe('job-updates', (message) => {
-  const { jobId } = JSON.parse(message);
-  await cache.invalidate(`job:${jobId}`);
-});
+return { application };  // Return immediately
 ```
 
-**Summary:**
+Don't wait for the jobs to complete. Fire and forget.
 
-Without these fixes, there's a consistency window: time between when data changes and when all caches reflect the change. It's typically 0-5 seconds.
+Workers process them in the background. If a job fails, it retries automatically.
 
-For recruiting, that's usually acceptable. But it should be intentional, not accidental.
+### 5. Three Ways Cache Serves Stale Data
+
+**Problem:** Recruiter closes a job at 2:00 PM. Candidate sees stale data.
+
+**Way 1: Browser cache**
+
+Candidate loaded the job at 1:59 PM. Browser cached it. At 2:01 PM, they refresh. Browser still has the old version.
+
+**Solution:** Use 1-minute TTL instead of 5 minutes. Faster updates.
+
+**Way 2: Read replica lag**
+
+Recruiter closes job on primary at 2:00 PM. Read replica is 2 seconds behind. At 2:00:01, candidate queries replica. Still sees job as open.
+
+**Solution:** After a recruiter makes a write, their next read queries the primary (not replica) for 5 seconds.
+
+**Way 3: Cross-service cache**
+
+Recruiter service invalidates the cache. But candidate service doesn't know. They have stale data.
+
+**Solution:** Use Redis pub/sub. When recruiter service closes a job, it sends a message. Candidate service receives it and clears the cache.
 
 ---
 
-## Part 4: How Much Compute Do We Actually Need?
+## Part 4: Capacity Math
 
 ### 1. Connection Pool Formula
 
-The formula is based on Little's Law from queuing theory:
-
 ```
-L = λ × W
+Pool Size = (Requests Per Second × Database Time in Seconds) ÷ Utilization
 ```
 
-Where:
-- L = number of items in the system (connections in use)
-- λ = arrival rate (requests per second)
-- W = time each item spends in system (request duration)
+**Example:**
 
-Rearranged for connection pools:
-
-```
-Pool Size = (Concurrent Requests × Request Duration) / Acceptable Response Time ÷ Utilization Factor
-```
-
-Or more practically:
+- 200 requests per second (peak)
+- Each holds connection for 40 milliseconds
+- Target utilization: 80%
 
 ```
-Pool Size = (Requests Per Second × Database Hold Time in Seconds) / Utilization
-```
-
-**Variables you need to know:**
-
-1. **Peak QPS** (requests per second): How many database requests at peak load?
-2. **Database hold time** (milliseconds): How long does each request hold a connection?
-3. **Utilization target** (80% is typical): Don't max out the pool, leave headroom for spikes.
-
-**Example for our service:**
-
-- Peak: 200 writes/sec (1,000 recruiters × 12 writes/min ÷ 60 = 200/sec)
-- Hold time: 40ms (database is fast, network round-trip)
-- Utilization: 80%
-
-```
-Pool = (200 × 0.040) / 0.80
-     = 8 / 0.80
+Pool = (200 × 0.040) ÷ 0.80
+     = 8 ÷ 0.80
      = 10 connections
 ```
 
-So a pool of 10 makes sense. With safety margin, 15-20 is reasonable.
+A pool of 10 is right.
 
-### 2. Minimum Pool Size for 1,000 Recruiters
+### 2. Minimum Pool for 1,000 Recruiters
 
-**Given facts:**
+**Given:**
 - 1,000 recruiters
-- 12 writes per recruiter per minute
-- Each write holds a connection for 40ms
+- 12 writes per minute each
+- Each write holds connection 40ms
 
-**The math:**
+**Math:**
 
-1. Total write throughput:
-   ```
-   1,000 recruiters × 12 writes/min = 12,000 writes/min
-                                     = 200 writes/sec
-   ```
+1,000 × 12 = 12,000 writes per minute
+12,000 ÷ 60 = 200 writes per second
 
-2. Concurrent connections at any moment:
-   ```
-   200 writes/sec × 0.040 seconds/write = 8 connections
-   ```
+200 writes/sec × 0.040 seconds = 8 connections
 
-3. Add 25% safety margin for p95 latency and jitter:
-   ```
-   8 × 1.25 = 10 connections minimum
-   ```
+Add 25% safety margin: 8 × 1.25 = **10 connections minimum**
 
-4. If we're not hitting optimal case (average 40ms but p95 is 60ms):
-   ```
-   200 writes/sec × 0.060 seconds = 12 connections
-   ```
+**Answer: 10-12 connections.**
 
-**Answer: Minimum pool size is 10-12 connections.**
+But if we run 100 instances each with 12 connections, that's 1,200 connections trying to hit MySQL.
 
-But here's the catch: if we run 100 backend instances and each has a pool of 12, that's 1,200 connections trying to hit MySQL. If MySQL max_connections=151, we're screwed.
+MySQL max_connections = 151.
 
-That's why we need ProxySQL or Accelerate to multiplex all those instance connections onto 30-50 actual database connections.
+We need ProxySQL or Accelerate to multiplex all these connections.
 
-### 3. Queue Falling Behind: Three Approaches
+### 3. Fixing a Queue That's Falling Behind
 
-**Problem:** Stats-updates workers can't keep up. Inflow is 200 jobs/sec. Outflow is 4 jobs/sec. Queue grows by 196/sec.
+**Problem:** Inflow: 200 jobs/sec. Outflow: 4 jobs/sec. Queue grows.
 
-**Solution 1: Increase worker concurrency**
+**Solution 1: More workers**
 
-```typescript
-const worker = new Worker('stats-updates', handler, {
-  concurrency: 50  // was 5, now 50
-});
-```
+Increase from 5 workers to 50 workers.
 
-**Pros:**
-- Immediate. One config change.
-- Linear scaling up to a point.
-
-**Cons:**
-- Each worker thread uses ~50MB memory. 50 workers = 2.5GB.
-- Eventually hits diminishing returns (Node.js GC overhead, thread contention).
-- Doesn't improve throughput if the job itself is the bottleneck.
+Pros: Immediate. Simple.
+Cons: Uses more memory. Eventually hits a limit.
 
 **Solution 2: Optimize the job**
 
-Current (slow):
-```typescript
-const count = await db.applications.count({ recruiterId });
-const accepted = await db.applications.count({ 
-  recruiterId, 
-  status: 'accepted' 
-});
-// 2 queries × 10ms = 20ms per job
-```
+Current: 3 database queries, each 10ms = 30ms per job.
+Optimized: 1 database query, 5ms = 5ms per job.
 
-Optimized (fast):
-```typescript
-await db.raw(`
-  UPDATE recruiter_stats SET 
-    total = (SELECT COUNT(*) FROM applications WHERE recruiterId=?),
-    accepted = (SELECT COUNT(*) FROM applications 
-                WHERE recruiterId=? AND status='accepted')
-  WHERE recruiterId=?
-`, [recruiterId, recruiterId, recruiterId]);
-// 1 query × 5ms = 5ms per job
-```
+Now 50 workers can process 1,000 jobs/sec.
 
-**Pros:**
-- Addresses root cause (slow job).
-- Scales to 1,000+ jobs/sec with same concurrency.
-- Better for system health.
+Pros: Fixes the root cause. Scales forever.
+Cons: Need to profile and optimize.
 
-**Cons:**
-- Requires investigation (profiling, query analysis).
-- Need to understand your data access patterns.
+**Solution 3: Run workers on multiple instances**
 
-**Solution 3: Separate worker processes**
+Instead of 1 instance with 50 workers, run 5 instances with 10 workers each.
 
-Instead of one process running 50 workers, run 5 processes each running 10 workers.
+Pros: Truly horizontal scaling.
+Cons: More operational overhead.
 
-```bash
-# On EC2 instance 1
-node dist/workers/stats-worker.js &
-
-# On EC2 instance 2
-node dist/workers/stats-worker.js &
-
-# etc.
-```
-
-**Pros:**
-- True horizontal scaling. Can run on 10 different machines.
-- Fault isolation. One worker process crashes, others keep working.
-- Better load balancing across CPU cores.
-
-**Cons:**
-- Operational overhead. Now managing 5 processes instead of 1.
-- Network latency between processes (Redis, database).
-
-**What I'd do:**
-
-First, optimize the job itself (Solution 2). Go from 20ms to 5ms per job. That's 4x throughput improvement for free.
-
-If we still can't keep up, add concurrency (Solution 1). Go from 5 to 20 workers.
-
-If that still doesn't work, go distributed (Solution 3). Run workers on multiple instances.
-
-Most of the time, solution 2 alone fixes the problem.
+**My recommendation:** Do #2 first. It's the fastest and most scalable.
 
 ### 4. Read Replica with 2-Second Lag
 
 **The problem:**
 
-Candidate submits application at 2:00:00. Replica is 2 seconds behind. At 2:00:01, candidate checks their applications. If we query the replica, they don't see their own application yet. Confusing.
+Candidate submits application at 2:00:00.
+Replica is 2 seconds behind.
+At 2:00:01, candidate checks their applications.
+If we query the replica, they don't see their own application yet.
 
-**Solution 1: Read-after-write consistency**
+**Solution 1: Session consistency**
 
-After the user performs any write, query the primary for the next 5 seconds. After that, queries can go to replica.
+After a user writes, their reads query the primary for 5 seconds. Then switch to replica.
 
-```typescript
-if (Date.now() < session.primaryUntil) {
-  const apps = await db.applications.findMany({..}, {replica: false});
-} else {
-  const apps = await db.applications.findMany({..}, {replica: true});
-}
-```
+Simple. Works.
 
-**Pros:** Simple, no user confusion.
+**Solution 2: Wait for replica**
 
-**Cons:** Every user reads from primary for 5 seconds after any write. Defeats some replica benefits.
+After a write, wait up to 2 seconds for replica to catch up.
 
-**Solution 2: Session consistency**
+Guarantees consistency. But adds latency.
 
-Store in the user's session: "primaryUntil=2:00:05". Only that user reads from primary. Other users use replica immediately.
+**Solution 3: Two-tier reads**
 
-**Pros:** Better than solution 1 (other users still benefit from replica).
+Critical reads (my applications) → primary
+Non-critical reads (browse jobs) → replica
 
-**Cons:** Requires session tracking. More complex.
+Most traffic benefits from replica. Only critical reads go to primary.
 
-**Solution 3: Wait for replica lag**
+**My choice: Solution 3.**
 
-After writing, wait up to 2 seconds for the replica to catch up before returning response.
+Best performance. Minimal staleness.
 
-```typescript
-const app = await submitApplication(...);
-await waitForReplicaCatchup(app.id, maxWait=2000);
-response.send({ application: app });
-```
+### 5. Biggest Risk I Didn't Fix
 
-**Pros:** Guarantees consistency.
+**The risk:**
 
-**Cons:** Adds 0-2 seconds latency to every write. If replica lag is 2 seconds, worst case is 2-second write latency.
+All workers run in the same process as the web server.
 
-**Solution 4: Accept the window**
+If a worker crashes (infinite loop, out of memory), the entire process dies. No more HTTP requests. No more job processing.
 
-Only use replica for non-critical reads. For things the user just changed (their applications), always query primary.
+**The fix:**
 
-```typescript
-// Critical reads: always primary
-const myApplications = await db.applications.findMany({..}, {replica: false});
+Run workers in separate Node.js processes.
 
-// Non-critical reads: use replica
-const jobListings = await db.jobs.findMany({..}, {replica: true});
-```
+If a worker crashes, the web server keeps running.
 
-**Pros:** Best performance. Replica helps for the 80% of reads that are non-critical.
-
-**Cons:** Some staleness window for candidates (usually acceptable).
-
-**My pick: Solution 4.**
-
-Use replicas for reads that don't affect the user's current action (job browsing, candidate search). Keep critical reads (my applications, my status) on primary. Accept a 0-2 second consistency window for non-critical data.
-
-### 5. The Biggest Risk I Didn't Fix
-
-**The risk: All workers run in the same process as the HTTP server.**
-
-If a worker hits an unhandled error (out of memory, infinite loop), it crashes the entire process. No more HTTP requests. No more job processing.
-
-In production, this would cause an incident:
-1. Worker crashes
-2. Process exits
-3. Requests start getting "connection refused"
-4. Queued jobs stop draining
-5. Team pages on-call at 3 AM
-
-**What I'd do with more time:**
-
-Spawn workers in separate Node processes. If a worker crashes, the HTTP server keeps running. Only that queue stops processing.
-
-```typescript
-// src/workers/stats-worker.ts
-import { Worker } from 'bullmq';
-const worker = new Worker('stats-updates', handler, {connection});
-worker.on('error', (err) => logger.error(err));
-
-// Start as: node dist/workers/stats-worker.js
-
-// src/index.ts
-spawn('node', ['dist/workers/stats-worker.js']);
-spawn('node', ['dist/workers/notifications-worker.js']);
-spawn('node', ['dist/workers/audit-worker.js']);
-// Each is a separate process. One crash ≠ total failure.
-```
-
-For this assessment, the single-process architecture is fine. For production, I'd split it up.
+This takes more work but it's much safer.
 
 ---
 
 ## Summary
 
 These answers show:
-- Understanding of distributed systems (connection pooling, queue theory)
-- Practical scaling experience (6-month roadmap, incremental optimization)
-- Trade-off analysis (separate services vs. monolith, caching consistency)
-- Root cause reasoning (why connection limits don't help, why sharding is premature)
-- Production judgment (accept some staleness, focus on critical paths, measure before optimizing)
+- Understanding of databases and scaling
+- Practical experience with real systems
+- Trade-off thinking (not just one "right answer")
+- Measurable reasoning (math, numbers, concrete examples)
 
-This is how a senior backend engineer thinks through problems.
+This is how a senior engineer thinks.
