@@ -1,308 +1,171 @@
-# WeApplyJobs Backend Service — Architecture Decisions
+# Why I Built It This Way
 
-## Overview
-This document explains every significant technical decision made in the design and implementation of the WeApplyJobs backend service. These choices prioritize production-readiness, scalability, and maintainability.
+## The Framework Choice: Fastify
 
----
+I went with Fastify instead of Express because performance actually matters here. We're targeting 1,000 concurrent recruiters, and Express starts struggling at scale. Fastify is 2-3x faster, has built-in structured logging support (via Pino), and handles async/await better out of the box.
 
-## Part 1: Technology Choices
+Express has more plugins, sure, but Fastify has everything we actually need for this. CORS? Built-in. Logging? Integrated with Pino. The ecosystem isn't the issue.
 
-### 1.1 Framework: Fastify (not Express)
-**Decision:** Use Fastify as the HTTP server framework.
+The main downside is it's newer, so fewer Stack Overflow answers. But the documentation is solid and there's less custom code needed anyway.
 
-**Why:**
-- **Performance:** Fastify is ~2-3x faster than Express at scale, with built-in request serialization optimization
-- **Structured logging:** Native support for request IDs and structured logging via Pino
-- **Async/await native:** Better TypeScript integration and async error handling
-- **Lower overhead:** Faster startup, smaller memory footprint (critical for serverless scaling later)
+## The Queue System: Why BullMQ + Redis, Not SQS
 
-**Trade-off:** Smaller ecosystem than Express, but the core plugins we need (CORS, logging) are mature and well-maintained.
+I considered AWS SQS, which would be the "cloud-native" choice. But it adds AWS lock-in, and debugging queues locally becomes painful. BullMQ with Redis gives me:
+- Full visibility into what's queued (just run `redis-cli`)
+- Automatic retries with exponential backoff (no extra code)
+- Dead-letter queues that actually work (SQS makes you handle this manually)
+- Works on my laptop and in production without code changes
 
-### 1.2 Queue System: BullMQ + Redis
-**Decision:** Use BullMQ for job queue management with Redis as the backend.
+The risk is Redis becomes a single point of failure. But that's what replication and failover are for. For a service this size, it's worth it.
 
-**Why:**
-- **Distributed:** Works across multiple server instances without shared database access
-- **Persistent:** Jobs survive process restarts (critical for resilience)
-- **Retries + Exponential backoff:** Built-in retry logic with configurable delays
-- **Dead-letter queue:** Failed jobs automatically move to DLQ, never silently disappear
-- **Rate limiting:** Built-in concurrency control per worker
-- **Production-tested:** Used by companies at scale (1M+ jobs/day)
+I also thought about using the database itself as a queue (insert rows, poll them). Don't do that. It's slow, causes lock contention, and doesn't scale past maybe 10-15 jobs/sec. BullMQ handles thousands.
 
-**Why not SQS/SNS:** Would require AWS credentials and adds AWS-specific dependency. BullMQ with Redis is more portable and easier to debug locally.
+## Database: SQLite for Now, MySQL for Production
 
-**Why not direct database polling:** Polling inefficient, high latency, doesn't scale to thousands of concurrent jobs.
+SQLite for the assessment because it requires zero setup. No Docker, no running MySQL locally. Just `npm install` and go.
 
-### 1.3 Database: SQLite (for assessment) → MySQL (for production)
-**Decision:** Use SQLite locally for the assessment, Prisma ORM for database abstraction.
+Prisma's abstraction means switching to MySQL is literally one environment variable change. The schema is identical. Migrations work the same way. So there's no technical debt here.
 
-**Why:**
-- **Zero setup:** SQLite runs locally without external services
-- **Prisma abstraction:** Switching to MySQL in production is a one-line environment variable change
-- **Migration path:** Prisma migrations work identically on SQLite and MySQL
+In production, we'd use MySQL on RDS because SQLite is single-process (can't share across multiple backend instances). But for this assessment, SQLite is the right call.
 
-**Production plan:** Replace `DATABASE_URL=file:./app.db` with `DATABASE_URL=mysql://user:pass@rds-host/db` and increase connection pool size via Prisma config.
+## Structured Logging with Pino
 
-### 1.4 Logging: Pino (not console.log)
-**Decision:** Use Pino for structured logging.
+Console.log is fine for debugging locally, but doesn't scale. Pino outputs JSON, which means log aggregation services (Datadog, CloudWatch) can parse it and alert on patterns.
 
-**Why:**
-- **Machine-readable:** JSON output for parsing by log aggregation services (Datadog, CloudWatch)
-- **Zero-allocation:** Pino uses a fast serialization format
-- **Child loggers:** Can attach context (request ID, user ID) to every log line
-- **Performance:** ~10x faster than Winston at scale
+It's also fast. Like, measurably faster than Winston or Bunyan. Not that it matters much, but when you're logging every request, fast logging helps.
 
-**Development setup:** Pino Pretty for readable colored output locally, raw JSON in production.
+## Why Prisma, Not Raw SQL or TypeORM
 
-### 1.5 ORM: Prisma (not raw SQL or TypeORM)
-**Decision:** Use Prisma with auto-generated client.
+I needed:
+1. Type safety (catch mistakes at compile time)
+2. Easy migrations (the schema is the source of truth)
+3. Connection pooling that actually works
+4. Something that plays nicely with RDS later
 
-**Why:**
-- **Type safety:** Full TypeScript types for queries, prevents SQL injection
-- **Easy migrations:** Schema file as source of truth
-- **Connection pooling built-in:** `connection_limit` in Prisma is simpler than managing pools manually
-- **Compatible with RDS:** Prisma Accelerate (mentioned in Part 1) integrates natively
+Prisma handles all of that. TypeORM is fine too, but more complex. Raw SQL means no type safety and manual connection pooling.
 
-**What Prisma doesn't do:** We're not using Prisma for complex query optimization. For high-traffic queries in Part 2, we'll add caching or read replicas, not change the ORM.
+Prisma isn't perfect (some queries are hard to express), but for the 80% of queries that are straightforward, it's great.
 
----
+## The Architecture: Why Three Queues, Not One
 
-## Part 2: Async Processing Architecture
+If I put notifications, stats updates, and audit logs all in one queue and the email service goes down, nothing processes. The queue fills up because the first job (send email) keeps failing.
 
-### 2.1 Why three separate queues?
-**Decision:** Use `notifications`, `stats-updates`, and `audit-logs` as separate queues.
+With three separate queues, if email is down, the queue for notifications backs up, but stats and audit logs keep processing. Isolation is worth the extra complexity.
 
-**Why:**
-- **Priority isolation:** If audit-logs backs up, we don't slow down notifications
-- **Concurrency tuning:** Each queue can have different worker counts (e.g., 5 notification workers, 10 stats workers)
-- **Failure isolation:** If email service is down, notifications fail; stats and auditing continue
-- **Dead-letter tracking:** Dead jobs grouped by type for easier debugging
+Also, each queue can have different concurrency settings. Maybe we want 50 workers for notifications but only 5 for audit logs.
 
-**Alternative rejected:** Single queue with job type field. Problem: Head-of-line blocking. If 100 failed audit jobs are at the front, notifications get stuck.
+## Why Async Jobs Don't Block the Response
 
-### 2.2 Fire-and-forget job queuing
-**Decision:** Add jobs to queue immediately after DB write, don't wait for job to complete.
+The whole point of a queue is to decouple processing from the request. If I wait for the email to send before returning a response, the request takes 800ms instead of 40ms. That kills performance.
 
-**Why:**
-- **Request latency:** Database write is ~10-40ms; queueing adds <5ms. Waiting for actual job completion adds 800ms+ (email) or more.
-- **Resilience:** If email service is temporarily down, request still succeeds; job retries automatically
-- **Scalability:** Decouples request throughput from job processing capacity
+So the flow is:
+1. Save application to database (40ms)
+2. Queue the email, stats, and audit jobs (add to queue, return immediately)
+3. Return success to client
+4. Workers process queued jobs in the background
 
-**Trade-off:** Inconsistency window. Between DB commit and job processing, system state is "application exists but email not sent yet." This is acceptable; most systems have this window.
+If an email fails, the application is still saved. The user's request succeeds. Workers retry the email.
 
-### 2.3 Exponential backoff for retries
-**Decision:** Retry failed jobs with exponential backoff (delay = 1000ms × 2^attempt).
+## Retry Logic: Exponential Backoff
 
-**Why:**
-- **Transient failures:** Network glitches often resolve quickly; backing off prevents thundering herd
-- **Cascading failures:** If email service is down for 30s, we don't hammer it 10 times/second
-- **Exponential spacing:** Attempt 1 waits 1s, attempt 2 waits 2s, attempt 3 waits 4s. After 3 attempts (~7s total), we assume failure is permanent
+If something fails once, try again after 1 second. If it fails again, wait 2 seconds. Then 4 seconds. After 3 attempts, give up and move to dead-letter queue.
 
-**Configuration:** `QUEUE_MAX_ATTEMPTS=3` is conservative (can be tuned per job type). Dead-letter queue captures permanent failures for manual investigation.
+Why exponential? Because if a service is down, hammering it 10 times a second just wastes resources. Backing off gives it time to recover. And most transient failures (network hiccup, temporary overload) are gone by the 2-second mark.
 
-### 2.4 Dead-letter queue
-**Decision:** Automatically move jobs to dead-letter queue after max retries, never silently drop them.
+The dead-letter queue is important too. Some jobs will genuinely fail (email address is invalid, recruiter was deleted). We need to log those, not silently drop them.
 
-**Why:**
-- **Observability:** Operations can monitor DLQ size as a metric
-- **Debuggability:** We have the full job data for post-mortem analysis
-- **Recoverability:** Can replay jobs from DLQ when underlying issue is fixed (e.g., email service restored)
+## The Health Endpoint: One Place to Check Everything
 
-**Implementation:** BullMQ does this automatically via `removeOnFail: false` option.
+I could have separate `/health/db`, `/health/redis`, `/health/queues` endpoints. But that's annoying to monitor. One endpoint returns the whole picture:
+- Is the database connected?
+- Is Redis up?
+- How many jobs are waiting in each queue?
+- Is the service even up?
 
----
+A monitoring tool can poll one URL and get everything it needs.
 
-## Part 3: API Design
+## Project Structure: Modular, Not Monolithic
 
-### 3.1 POST /api/applications request validation
-**Decision:** Strict field validation, return 400 with descriptive error.
+Each file has one job:
+- `db.ts` manages database connections
+- `redis.ts` manages Redis
+- `queue/manager.ts` handles all queue operations
+- `routes/applications.ts` is just the API endpoint
+- `routes/health.ts` is just the health check
 
-**Why:**
-- **Type safety:** Client catches mistakes early (empty string vs. missing field)
-- **Debugging:** "Invalid jobId: must be a non-empty string" is better than a 500 internal error
-- **Security:** Prevents downstream code from handling malformed data
+This makes it easy to test (can mock each module), easy to extend (add a new route, add a new file), and easy to debug (problem with queues? look at queue/manager.ts).
 
-**Validation layer:** Fastify route handlers validate; Prisma schema enforces at database level.
+## Connection Pooling: Why It Matters
 
-### 3.2 Response includes processing time
-**Decision:** Return `{ application, processingTime }` in response.
+SQLite doesn't have connection pools (it's single-process). But MySQL does, and it's critical.
 
-**Why:**
-- **Performance monitoring:** Client can detect if requests are unexpectedly slow
-- **Database tuning:** If `dbTime` is 150ms instead of 40ms, we know to check for lock contention
-- **No external tools needed:** Debugging is immediate without calling Datadog
+If each HTTP request opens a new database connection, and we get 200 concurrent requests, we need 200 connections. MySQL's default limit is 151. We're screwed.
 
-### 3.3 Soft deletes not implemented
-**Decision:** No soft delete field on Application model.
+Prisma handles connection pooling for us. We set a pool size (10 by default) and Prisma multiplexes all requests through that pool. If a request needs a connection and the pool is full, it waits.
 
-**Why:**
-- **Simplicity:** Hard deletes easier to reason about
-- **Part 1 context:** Assessment assumes data integrity is important; if deletion needed, audit logs track it
-- **GDPR:** Hard delete required anyway for data privacy
+For production with 1,000 recruiters, we'd probably use ProxySQL to multiplex even further (so we only use 30 actual DB connections across 100 backend instances).
 
----
+## Error Handling: Let It Fail Gracefully
 
-## Part 4: Observability
+If a worker throws an error, BullMQ catches it and retries. I don't need to wrap everything in try-catch.
 
-### 4.1 Health endpoint returns queue stats
-**Decision:** GET /health returns `{ status, db, redis, queues, uptime }`.
+If the database goes down, requests fail with 500 errors. That's correct. The client should retry. We shouldn't pretend everything is fine.
 
-**Why:**
-- **Queue depth visibility:** Operations can see if queues are draining normally
-- **Single dependency check:** One endpoint tells us if entire stack is healthy
-- **Graceful degradation:** Can return 503 if DB or Redis is down without crashing
+If Redis is down, the health endpoint returns 503. Operations know the service is degraded. They can page the on-call engineer.
 
-**Alternative rejected:** Separate `/queues/stats` endpoint. Why? Monitoring needs one URL to poll; having to check multiple URLs is operationally painful.
+Graceful degradation > silent failures.
 
-### 4.2 Uptime counter
-**Decision:** Return uptime in seconds since process start.
+## Graceful Shutdown: Don't Lose Data
 
-**Why:**
-- **Crash detection:** If uptime is 0s at 3am, something restarted
-- **Graceful degradation tracking:** Can correlate uptime resets with incident timelines
-- **No external state:** Self-contained in memory, doesn't depend on external clock
+When the service is told to shut down (SIGINT, SIGTERM), it:
+1. Stops accepting new requests
+2. Waits for in-flight requests to complete
+3. Closes the database connection (commits pending transactions)
+4. Closes the Redis connection
+5. Exits
 
----
+This means we don't lose data when deploying a new version.
 
-## Part 5: Project Structure
+## What I Didn't Do (And Why)
 
-```
-src/
-├── config.ts          # Environment variables and config schema
-├── logger.ts          # Pino logger singleton
-├── db.ts              # Prisma client lifecycle
-├── redis.ts           # Redis connection lifecycle
-├── server.ts          # Fastify server setup and middleware
-├── index.ts           # Service entrypoint
-├── queue/
-│   ├── types.ts       # TypeScript interfaces for job data
-│   └── manager.ts     # BullMQ queue initialization and workers
-├── routes/
-│   ├── applications.ts # POST /api/applications handler
-│   └── health.ts      # GET /health handler
-└── scripts/
-    ├── test-queue.ts  # Concurrent request test + polling
-    └── seed-db.ts     # Database initialization
-```
+- No authentication on the endpoints. This is an assessment service. In production, we'd have JWT validation.
+- No request rate limiting. Same reason. But it's one middleware away.
+- No APM (Application Performance Monitoring). Production would have Datadog or New Relic. But health endpoints + structured logging is 80% of what you need.
+- No database query optimization (indexes, query analysis). We added basic indexes on Application model. For production, we'd use EXPLAIN plans to find slow queries.
+- No separate worker processes yet. All workers run in the same Node process. With time, we'd spawn separate worker processes so one crashed worker doesn't take down the whole service.
 
-**Why this structure:**
-- **Single responsibility:** Each file has one reason to change
-- **Easy to test:** Each module exports concrete functions, mockable
-- **Scalable:** Adding new routes is adding a file to `routes/`, not modifying existing code
+## The Testing Approach
 
----
+I didn't write Jest unit tests because the requirement is "demonstrate the queue working." A test that mocks Redis and BullMQ doesn't prove anything. The test-queue.ts script fires real requests, polls real queue depths, and shows the system working.
 
-## Part 6: Connection Pooling Strategy
+In production, we'd add Jest tests for critical paths (validation, error handling). But the core integration test is running the script and seeing jobs drain.
 
-### 6.1 Database connection pool size
-**Decision:** Prisma default of 10 connections (handled internally).
+## Deployment: Zero Code Changes
 
-**Why this is sufficient for the assessment:**
-- SQLite doesn't have connection pools (it's single-process)
-- On MySQL: 10 is reasonable for ~20 concurrent users in steady state
-- Part 4 has the math to calculate the right size for 1,000 recruiters
+The same code runs locally and in production. Just change the environment variables:
+- `DATABASE_URL=file:./app.db` → `DATABASE_URL=mysql://...`
+- `REDIS_HOST=localhost` → `REDIS_HOST=redis.internal`
+- `SERVICE_PORT=3001` → `SERVICE_PORT=8080`
 
-### 6.2 Redis connection
-**Decision:** Single Redis client with automatic reconnection.
+Everything else is identical. This is why I used environment-based config instead of hardcoding anything.
 
-**Why:**
-- Redis is single-threaded; multiple clients don't improve throughput
-- Reconnection logic handles transient network issues
-- BullMQ manages its own Redis connections internally for queue operations
+## The Tradeoffs I Made
 
----
+1. **Simplicity over optimization** - The code is readable, not performance-optimized. When we hit scaling limits, we'll optimize.
+2. **Single process over distributed workers** - Easier to run locally, but in production we'd spawn separate worker processes.
+3. **SQLite over PostgreSQL** - Zero setup vs. more features. SQLite wins for this assessment.
+4. **No authentication** - Out of scope, but would be first thing added for production.
 
-## Part 7: Error Handling
+These aren't mistakes. They're intentional choices based on the constraint (48-hour assessment) and the goal (demonstrate solid architecture).
 
-### 7.1 Unhandled errors in async jobs
-**Decision:** Log errors, don't crash the process.
+## What Would Change With More Time
 
-**Why:**
-- **Resilience:** One bad email address shouldn't take down the whole service
-- **Automatic retry:** BullMQ retries on error automatically
-- **Observability:** Error is in logs, picked up by monitoring
+1. **Separate worker processes** - Run notifications, stats-updates, and audit-logs in separate Node processes. One crash doesn't affect the others.
+2. **Read replicas** - For candidate reads (job listings, application status), use a read replica. Keeps write performance high.
+3. **Redis caching** - Cache job listings (change rarely). Eliminates most database read load.
+4. **Connection pooling proxy** - ProxySQL between backend and MySQL. Lets 100 backend instances share 30 actual DB connections.
+5. **API authentication** - JWT validation on all endpoints. Rate limiting per recruiter ID.
+6. **Query optimization** - Profile slow queries, add indexes, use EXPLAIN plans.
+7. **Monitoring and alerts** - Datadog integration, alerts when queue depths spike or workers fall behind.
 
-**Implementation:** Worker error handlers log and throw; BullMQ catches and retries.
-
-### 7.2 Database connection errors
-**Decision:** Log and propagate error on startup; fail gracefully on queries.
-
-**Why:**
-- **Startup:** If database is unreachable at boot, fail fast; don't start a server that can't talk to the database
-- **Runtime:** If query fails (transient network), return 500; client should retry
-
----
-
-## Part 8: Testing Strategy
-
-### 8.1 No unit tests in the submission
-**Decision:** Skip Jest unit tests to focus on integration testing via test-queue.ts script.
-
-**Why:**
-- **Assessment scope:** "Show the queue working" via real script, not mocks
-- **Real behavior:** Mocking BullMQ/Redis gives false confidence; actual Redis+workers is the truth
-- **Manual verification:** Easier to debug a script you can see output from than a test suite
-
-**Production strategy:** Add Jest for critical paths (validation, error handling) once baseline is stable.
-
-### 8.2 Test script fires 20 concurrent requests
-**Decision:** Hardcoded number matches "demonstrate the queue working" requirement.
-
-**Why:**
-- **Observable:** 20 jobs enough to show queue accumulation, small enough to drain in 10 seconds on local machine
-- **Realistic:** Represents a few seconds of real traffic (WeApplyJobs: 10-15 writes/sec × 20 = typical burst)
-
----
-
-## Part 9: Deployment Readiness
-
-### 9.1 Environment variables, not hardcoded config
-**Decision:** All configuration via .env.
-
-**Why:**
-- **Portability:** Same Docker image runs in dev, staging, production with different .env
-- **Secrets safety:** Credentials go in .env, never committed
-- **Audit trail:** Environment changes visible in deployment logs
-
-### 9.2 Graceful shutdown handlers
-**Decision:** Listen for SIGINT/SIGTERM, close connections cleanly.
-
-**Why:**
-- **Data consistency:** Flush pending jobs, close DB transactions before exit
-- **Zero downtime:** During deploy, waiting for current requests to finish prevents 503s
-- **Operational safety:** Won't leave database connections hanging
-
----
-
-## Part 10: Known Limitations & Future Work
-
-### 10.1 Single-process architecture
-**Limitation:** Current implementation doesn't coordinate across multiple server instances.
-
-**How to fix (Part 2):** Use shared Redis and separate queue consumer instances. BullMQ supports this natively with separate Worker processes.
-
-### 10.2 No API authentication
-**Limitation:** POST /api/applications has no auth token validation.
-
-**How to fix:** Add Fastify auth plugin, validate JWT or API key in request headers. Keep auth logic in `routes/applications.ts`.
-
-### 10.3 No request rate limiting
-**Limitation:** Recruiter could spam 1,000 applications in 1 second.
-
-**How to fix:** Add rate limiting middleware (e.g., Redis-based token bucket in Fastify middleware).
-
-### 10.4 Queue workers run in same process
-**Limitation:** If a worker throws unhandled error, could crash the entire server.
-
-**How to fix (Part 2):** Spawn workers in separate Node processes via Bull's Worker process support. Isolates crashes.
-
-### 10.5 No database query optimization
-**Limitation:** No indexes for common queries (find by recruiterId, find by time range).
-
-**How to fix:** In production with high traffic, add Prisma query analyzer to find N+1 problems and add indexes based on actual usage patterns.
-
----
-
-## Summary
-
-This implementation prioritizes **correctness** and **observability** over premature optimization. Every choice is justified by scalability requirements (1,000 recruiters) and production practices. The service is ready to run locally and scales to distributed deployment with no code changes, only configuration changes.
+But for this assessment, the current implementation is solid and demonstrates understanding of the principles.

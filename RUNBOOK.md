@@ -1,88 +1,81 @@
-# WeApplyJobs Backend Service — Runbook
+# How to Run This Thing
 
-This document contains exact commands to run the service locally end-to-end.
+## Before You Start
 
-## Prerequisites
+You need:
+- Node.js 18 or newer (check with `node --version`)
+- Redis running locally (we use it for the job queues)
+- npm (comes with Node)
 
-- Node.js 18+ (check with `node --version`)
-- Redis server running locally (check with `redis-cli ping`)
-- npm or yarn (comes with Node.js)
+### Getting Redis Running
 
-### Redis Setup
-
-#### macOS/Linux
+**On Mac:**
 ```bash
-# Using Homebrew
 brew install redis
 brew services start redis
-
-# Verify running
-redis-cli ping  # Should output "PONG"
+redis-cli ping  # Should say PONG
 ```
 
-#### Windows
+**On Linux:**
 ```bash
-# Using Windows Subsystem for Linux (WSL)
-wsl
-sudo apt-get update
 sudo apt-get install redis-server
 redis-server
-
-# Or use Docker
-docker run -d -p 6379:6379 redis:latest
+# Or with systemd:
+sudo systemctl start redis-server
+redis-cli ping
 ```
 
-#### Verify Redis
-```bash
-redis-cli ping  # Should output "PONG"
-```
+**On Windows:**
+You have two options:
+1. Use WSL (Windows Subsystem for Linux)
+   ```bash
+   wsl
+   sudo apt-get install redis-server
+   redis-server
+   ```
+2. Use Docker
+   ```bash
+   docker run -d -p 6379:6379 redis:latest
+   ```
 
----
+Verify it's running: `redis-cli ping` should output `PONG`.
 
-## Installation & Startup
+## Getting Started
 
 ### 1. Install Dependencies
+
 ```bash
 cd c:\Users\Admin\Desktop\weapplyjobs
-
 npm install
 ```
 
-**Expected output:**
-```
-added 150 packages in 45s
-```
+This takes a minute. You're downloading Fastify, BullMQ, Prisma, Redis client, etc.
 
-### 2. Set up Database
-
-Initialize Prisma and create SQLite database:
+### 2. Set Up the Database
 
 ```bash
 npx prisma migrate dev --name init
 ```
 
-This will:
-- Create `prisma/migrations/` folder
-- Generate `app.db` SQLite database
-- Generate Prisma client in `node_modules/@prisma/client`
+This:
+- Creates a migrations folder
+- Generates the SQLite database (app.db)
+- Sets up the Prisma client
 
-**Expected output:**
+You'll see:
 ```
 ✔ Enter a name for this migration: init
-✔ Your migration has been created at prisma/migrations/[timestamp]_init/migration.sql
-PostgreSQL database has been created at file:./app.db
+✔ Your migration has been created
+SQLite database has been created at file:./app.db
 ```
 
-### 3. Build TypeScript
+### 3. Build TypeScript (Optional, But Do It)
 
 ```bash
 npm run build
 ```
 
-**Expected output:**
-```
-Successfully compiled 8 files with tsc
-```
+Compiles all .ts files to .js in the dist/ folder. Good for catching type errors before running.
 
 ### 4. Start the Service
 
@@ -90,7 +83,8 @@ Successfully compiled 8 files with tsc
 npm run dev
 ```
 
-**Expected output:**
+This runs the service in development mode. You should see:
+
 ```
 [14:23:45] INFO: Initializing WeApplyJobs backend service
 [14:23:46] INFO: Database connected successfully
@@ -99,19 +93,18 @@ npm run dev
 [14:23:46] INFO: Server started successfully (port: 3001, host: localhost)
 ```
 
-**Service is now running at `http://localhost:3001`**
-
----
+The service is now running on `http://localhost:3001`. Leave this terminal open.
 
 ## Testing the Service
 
-### In a new terminal, run the queue test script:
+Open a **new terminal** and run the test script:
 
 ```bash
 npm run test:queue
 ```
 
-**Expected output:**
+You should see:
+
 ```
 WeApplyJobs Queue Test Script
 ============================
@@ -133,33 +126,25 @@ Time    | Notifications (W/A/F) | Stats Updates (W/A/F) | Audit Logs (W/A/F)
 03s    | 5/5/0           | 5/5/0           | 5/5/0
 04s    | 0/5/0           | 0/5/0           | 0/5/0
 05s    | 0/0/0           | 0/0/0           | 0/0/0
-06s    | 0/0/0           | 0/0/0           | 0/0/0
-07s    | 0/0/0           | 0/0/0           | 0/0/0
-08s    | 0/0/0           | 0/0/0           | 0/0/0
-09s    | 0/0/0           | 0/0/0           | 0/0/0
-
-✓ Queue monitoring complete
-
-Test script completed successfully!
 ```
 
-**What's happening:**
-- At T=0s: 20 jobs just queued, all in "waiting" state
-- At T=1-2s: Workers pick up jobs, move them to "active" state
-- At T=3-4s: Jobs complete and drain from queue
+This is exactly what we want:
+- At T=0s: 20 jobs just queued, all waiting
+- At T=1-2s: Workers pick them up (move to active)
+- At T=3-4s: Jobs complete and disappear
 - At T=5s+: Queue is empty
 
----
+If you see this, the service is working correctly.
 
-## Manual Testing
+## Manual Testing (The Curl Way)
 
-### Test Health Endpoint
+### Health Check
 
 ```bash
 curl http://localhost:3001/health
 ```
 
-**Expected output:**
+Should return (pretty-printed):
 ```json
 {
   "status": "ok",
@@ -186,27 +171,29 @@ curl http://localhost:3001/health
 }
 ```
 
-### Test Application Submission
+If you see 503 instead, it means either the database or Redis is down.
+
+### Submit an Application
 
 ```bash
 curl -X POST http://localhost:3001/api/applications \
   -H "Content-Type: application/json" \
   -d '{
     "jobId": "job-123",
-    "candidateId": "cand-456",
+    "candidateId": "candidate-456",
     "recruiterId": "recruiter-789",
-    "coverLetter": "I am very interested in this role."
+    "coverLetter": "I am interested in this role."
   }'
 ```
 
-**Expected output (HTTP 201):**
+Should return (HTTP 201):
 ```json
 {
   "success": true,
   "application": {
     "id": "clq2x3y4z5a6b7c8d9e0f1g2h",
     "jobId": "job-123",
-    "candidateId": "cand-456",
+    "candidateId": "candidate-456",
     "recruiterId": "recruiter-789",
     "status": "submitted",
     "createdAt": "2024-08-20T14:25:33.123Z"
@@ -215,86 +202,82 @@ curl -X POST http://localhost:3001/api/applications \
 }
 ```
 
-### Test Invalid Request
+The processingTime is in milliseconds. Should be 30-80ms.
+
+### Test Validation
 
 ```bash
 curl -X POST http://localhost:3001/api/applications \
   -H "Content-Type: application/json" \
-  -d '{"jobId": "job-123"}'
+  -d '{
+    "jobId": "job-123"
+  }'
 ```
 
-**Expected output (HTTP 400):**
+Should return (HTTP 400):
 ```json
 {
   "error": "Invalid candidateId: must be a non-empty string"
 }
 ```
 
----
+Good. The API is validating input correctly.
 
-## Observing Retry Behavior
+## Watching Retries Happen
 
-To see exponential backoff and retry logic in action:
+Want to see the retry logic in action? It's actually pretty cool.
 
-### 1. Modify the worker to intentionally fail:
-
-Edit `src/queue/manager.ts`, find the `handleNotificationJob` function and add:
+Edit `src/queue/manager.ts`. Find the `handleNotificationJob` function (around line 21) and make it fail:
 
 ```typescript
 async function handleNotificationJob(job: any) {
-  const { applicationId } = job.data;
+  const { applicationId, email } = job.data;
   
-  // TEMPORARY: Make this fail so we can observe retries
+  // Make this intentionally fail
   if (job.attemptsMade < 2) {
     throw new Error('Simulated failure for testing');
   }
   
   logger.info({...}, 'Processing notification job');
-  // rest of function...
+  return { processed: true, timestamp: new Date() };
 }
 ```
 
-### 2. Rebuild and restart:
-
+Then rebuild and restart:
 ```bash
 npm run build
 npm run dev
 ```
 
-### 3. Submit a request:
-
+Submit an application:
 ```bash
 curl -X POST http://localhost:3001/api/applications \
   -H "Content-Type: application/json" \
   -d '{
-    "jobId": "job-999",
-    "candidateId": "cand-999",
-    "recruiterId": "recruiter-999",
-    "coverLetter": "Test"
+    "jobId": "test-job",
+    "candidateId": "test-candidate",
+    "recruiterId": "test-recruiter",
+    "coverLetter": "test"
   }'
 ```
 
-### 4. Watch the logs:
-
-In the server terminal, you'll see:
+Watch the server logs. You'll see:
 ```
-[14:32:10] WARN Notification job failed (attempt 1/3, retrying in 1000ms)
-[14:32:11] WARN Notification job failed (attempt 2/3, retrying in 2000ms)
+[14:32:10] WARN Notification job failed (will retry in 1000ms)
+[14:32:11] WARN Notification job failed (will retry in 2000ms)
 [14:32:13] INFO Notification job completed
 ```
 
-After all attempts fail, the job moves to dead-letter queue and you'll see:
+After it retries 3 times and still fails, the job moves to the dead-letter queue:
 ```
 [14:32:15] ERROR Notification job moved to failed queue
 ```
 
-**Remove the simulated failure before submitting the assessment.**
+**Don't forget to remove this error before submitting!**
 
----
+## Checking Redis Directly
 
-## Monitoring Queue Behavior in Redis
-
-To inspect what's in Redis directly:
+You can peek inside Redis to see what's actually happening:
 
 ```bash
 redis-cli
@@ -302,23 +285,23 @@ redis-cli
 # List all keys
 > KEYS "*"
 
-# Get job data from notifications queue
-> LRANGE "bull:notifications:wait" 0 -1
-
-# Get job count
+# Get notifications queue length
 > LLEN "bull:notifications:wait"
+
+# See what's in the stats queue
+> LRANGE "bull:stats-updates:wait" 0 -1
 
 # Exit
 > EXIT
 ```
 
----
+This is useful for debugging. If jobs aren't draining, you can see if they're actually in Redis.
 
 ## Stopping the Service
 
 In the terminal running `npm run dev`, press `Ctrl+C`.
 
-**Expected output:**
+You should see:
 ```
 [14:35:22] INFO: Received shutdown signal: SIGINT
 [14:35:22] INFO: Server stopped successfully
@@ -329,18 +312,21 @@ In the terminal running `npm run dev`, press `Ctrl+C`.
 [14:35:22] INFO: Service shut down gracefully
 ```
 
----
+The service cleans up connections before exiting. Good.
 
-## Troubleshooting
+## Common Issues and Fixes
 
 ### "Redis connection refused"
 
-**Problem:** Redis is not running.
+Redis isn't running.
 
-**Solution:**
+**Fix:**
 ```bash
-# macOS/Linux
+# macOS
 brew services start redis
+
+# Linux
+sudo systemctl start redis-server
 
 # Windows (Docker)
 docker run -d -p 6379:6379 redis:latest
@@ -351,18 +337,18 @@ redis-cli ping
 
 ### "ENOENT: no such file or directory, open 'app.db'"
 
-**Problem:** Database migration wasn't run.
+You skipped the Prisma migration step.
 
-**Solution:**
+**Fix:**
 ```bash
 npx prisma migrate dev --name init
 ```
 
 ### "Port 3001 already in use"
 
-**Problem:** Another service is running on port 3001.
+Something else is running on 3001.
 
-**Solution:** Either stop that service or change `SERVICE_PORT` in `.env`:
+**Fix:** Change the port in `.env`:
 ```bash
 SERVICE_PORT=3002
 npm run dev
@@ -370,9 +356,9 @@ npm run dev
 
 ### "Cannot find module '@prisma/client'"
 
-**Problem:** Dependencies weren't installed.
+Dependencies didn't install correctly.
 
-**Solution:**
+**Fix:**
 ```bash
 npm install
 npx prisma generate
@@ -380,83 +366,48 @@ npx prisma generate
 
 ### Requests hang or timeout
 
-**Problem:** Service crashed silently or network issue.
+Service might have crashed silently. Check:
+1. Is Redis running? (`redis-cli ping`)
+2. Are there errors in the terminal?
+3. Restart: `npm run dev`
 
-**Solution:**
+### Everything seems broken
+
+Try from scratch:
 ```bash
-# Check if Redis is running
-redis-cli ping
-
-# Check logs for errors (if running in background)
-# Restart with visible logs
+rm -rf node_modules app.db
+npm install
+npx prisma migrate dev --name init
 npm run dev
 ```
 
----
+## What You Should See When It Works
 
-## Production Deployment (not for assessment, but helpful context)
+1. **Service starts** → "Server started successfully (port: 3001)"
+2. **Health check responds** → HTTP 200 with queue stats
+3. **Create application** → HTTP 201, returns application ID
+4. **Queue test runs** → Shows jobs queueing then draining to zero
+5. **Graceful shutdown** → Closes connections cleanly
 
-### Switching from SQLite to MySQL
+If all of these work, the service is correctly implemented.
 
-Update `.env`:
-```bash
-DATABASE_URL=mysql://username:password@rds.amazonaws.com:3306/weapplyjobs
-```
+## Performance Baseline
 
-Generate new migrations:
-```bash
-npx prisma migrate dev --name switch_to_mysql
-npx prisma db push
-```
+On a local machine with SQLite:
+- Application submission: 40-80ms end-to-end
+- Database write: 10-25ms
+- Queue drain rate: ~5-6 jobs per second per worker
+- Health check: <10ms
 
-Increase connection pool in `prisma/schema.prisma`:
-```prisma
-datasource db {
-  provider = "mysql"
-  url      = env("DATABASE_URL")
-  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
-  
-  // Increase from default 10 to handle 1,000 recruiters
-  connectionLimit = 50
-}
-```
-
-### Docker Build
-
-```dockerfile
-FROM node:20-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
-COPY dist/ ./dist/
-COPY prisma/ ./prisma/
-CMD ["npm", "start"]
-```
-
-Build and run:
-```bash
-docker build -t weapplyjobs:latest .
-docker run -e DATABASE_URL=mysql://... -e REDIS_HOST=redis-host -p 3001:3001 weapplyjobs:latest
-```
-
----
-
-## Performance Baseline (on local machine)
-
-After running `npm run test:queue`, you should see:
-- **Application submission:** 40-80ms end-to-end
-- **Database write:** 10-25ms
-- **Queue draining:** 20 jobs → empty in ~3-4 seconds (5-6 jobs/sec per worker)
-
-These metrics are expected on local SQLite. On MySQL RDS with optimized queries, database time will be consistent 5-10ms, and throughput will be much higher.
-
----
+These numbers are normal. In production with MySQL, database writes would be 5-10ms, making the whole request even faster.
 
 ## Next Steps
 
-1. Verify all 4 parts of the assessment work
-2. Check your answers in ANSWERS.md
-3. Run `npm run build` to ensure TypeScript compilation succeeds
-4. Commit everything to GitHub
-5. Create a private repo and share the link
+Once you verify it works locally:
+1. Read ANSWERS.md to understand the written questions
+2. Read DECISIONS.md to understand the architecture choices
+3. Run through the test script a few times
+4. Push to GitHub as a private repo
+5. Submit the repo link
 
+That's it. You're done.
