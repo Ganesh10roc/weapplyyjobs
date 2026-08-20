@@ -1,0 +1,42 @@
+// prisma/schema.prisma
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Application {
+  id              String   @id @default(cuid())
+  jobId           String
+  candidateId     String
+  recruiterId     String
+  coverLetter     String
+  status          String   @default("submitted")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([jobId])
+  @@index([candidateId])
+  @@index([recruiterId])
+  @@index([createdAt])
+}
+
+model QueueJob {
+  id              String   @id @default(cuid())
+  queueName       String
+  jobId           String   @unique
+  status          String   @default("pending")
+  data            String
+  error           String?
+  retries         Int      @default(0)
+  maxRetries      Int      @default(3)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([queueName])
+  @@index([status])
+  @@index([createdAt])
+}
