@@ -16,7 +16,7 @@
     "format": "prettier --write src"
   },
   "keywords": ["fastify", "bullmq", "redis", "async-queue", "applications"],
-  "author": "pavangupta@lifemine.io",
+  "author": "sriramulaganesh375@gmail.com",
   "license": "ISC",
   "dependencies": {
     "@prisma/client": "^5.14.0",
